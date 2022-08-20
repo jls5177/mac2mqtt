@@ -2,9 +2,11 @@ package main
 
 import (
 	"fmt"
+	"github.com/andybrewer/mack"
 	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"os"
 	"os/exec"
 	"regexp"
@@ -101,28 +103,6 @@ func getCommandOutput(name string, arg ...string) string {
 	return stdoutStr
 }
 
-func getMuteStatus() bool {
-	output := getCommandOutput("/usr/bin/osascript", "-e", "output muted of (get volume settings)")
-
-	b, err := strconv.ParseBool(output)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	return b
-}
-
-func getCurrentVolume() int {
-	output := getCommandOutput("/usr/bin/osascript", "-e", "output volume of (get volume settings)")
-
-	i, err := strconv.Atoi(output)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	return i
-}
-
 func runCommand(name string, arg ...string) {
 	cmd := exec.Command(name, arg...)
 
@@ -132,35 +112,26 @@ func runCommand(name string, arg ...string) {
 	}
 }
 
-// from 0 to 100
-func setVolume(i int) {
-	runCommand("/usr/bin/osascript", "-e", "set volume output volume "+strconv.Itoa(i))
-}
-
-// true - turn mute on
-// false - turn mute off
-func setMute(b bool) {
-	runCommand("/usr/bin/osascript", "-e", "set volume output muted "+strconv.FormatBool(b))
-}
-
-func commandSleep() {
-	runCommand("pmset", "sleepnow")
-}
-
-func commandDisplaySleep() {
-	runCommand("pmset", "displaysleepnow")
-}
-
-func commandShutdown() {
-
-	if os.Getuid() == 0 {
-		// if the program is run by root user we are doing the most powerfull shutdown - that always shuts down the computer
-		runCommand("shutdown", "-h", "now")
-	} else {
-		// if the program is run by ordinary user we are trying to shutdown, but it may fail if the other user is logged in
-		runCommand("/usr/bin/osascript", "-e", "tell app \"System Events\" to shut down")
+func setMusicVolume(level uint8) {
+	fmt.Printf("DEBUG: telling Music to set volume level to %v\n", level)
+	_, err := mack.Tell("Music", fmt.Sprintf("set sound volume to %v", level))
+	if err != nil {
+		fmt.Println(fmt.Errorf("failed to set music volume to %v: %v", level, err))
 	}
+}
 
+func setMusicPlayPause(play bool) {
+	var op string
+	if play {
+		op = "play"
+	} else {
+		op = "pause"
+	}
+	fmt.Printf("DEBUG: telling Music to %v\n", op)
+	_, err := mack.Tell("Music", op)
+	if err != nil {
+		fmt.Println(fmt.Errorf("failed telling Music to %v: %v", op, err))
+	}
 }
 
 var messagePubHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Message) {
@@ -170,26 +141,59 @@ var messagePubHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Me
 var connectHandler mqtt.OnConnectHandler = func(client mqtt.Client) {
 	log.Println("Connected to MQTT")
 
-	token := client.Publish(getTopicPrefix()+"/status/alive", 0, true, "true")
-	token.Wait()
+	mqttClient := NewMQQTClient(client)
 
 	log.Println("Sending 'true' to topic: " + getTopicPrefix() + "/status/alive")
+	mqttClient.PublishAndWait("/status/alive", 0, true, "true")
 
-	listen(client, getTopicPrefix()+"/command/#")
+	listen(mqttClient, "/command/#")
 }
 
 var connectLostHandler mqtt.ConnectionLostHandler = func(client mqtt.Client, err error) {
 	log.Printf("Disconnected from MQTT: %v", err)
 }
 
-func getMQTTClient(ip, port, user, password string) mqtt.Client {
+func NewMQQTClient(client mqtt.Client) *MQQTClient {
+	return &MQQTClient{
+		client: client,
+	}
+}
 
+type MQQTMessageHandler func(*MQQTClient, mqtt.Message)
+
+type MQQTClient struct {
+	client mqtt.Client
+}
+
+func (c *MQQTClient) PublishAndWait(topic string, qos byte, retained bool, msg interface{}) {
+	t := c.client.Publish(getTopicPrefix()+topic, qos, retained, msg)
+	go func() {
+		ok := t.WaitTimeout(1 * time.Second)
+		if t.Error() != nil {
+			fmt.Println(fmt.Errorf("failed publishing message to topic, %s: %v", topic, t.Error()))
+		} else if !ok {
+			fmt.Printf(fmt.Sprintf("timed out publishing message to topic, %s", topic))
+		}
+	}()
+}
+
+func (c *MQQTClient) Subscribe(topic string, qos byte, callback MQQTMessageHandler) mqtt.Token {
+	return c.client.Subscribe(getTopicPrefix()+topic, qos, func(client mqtt.Client, message mqtt.Message) {
+		callback(NewMQQTClient(client), message)
+	})
+}
+
+func getMQTTClient(broker_uri, user, password, topicPrefix string) *MQQTClient {
 	opts := mqtt.NewClientOptions()
-	opts.AddBroker(fmt.Sprintf("tcp://%s:%s", ip, port))
+	opts.AddBroker(broker_uri)
+	opts.SetClientID(fmt.Sprintf("mac2mqtt-%v", strconv.Itoa(int(uint8(rand.Uint32())))))
 	opts.SetUsername(user)
 	opts.SetPassword(password)
 	opts.OnConnect = connectHandler
 	opts.OnConnectionLost = connectLostHandler
+	opts.SetOrderMatters(false)
+	opts.SetAutoReconnect(true)
+	opts.SetCleanSession(true)
 
 	opts.SetWill(getTopicPrefix()+"/status/alive", "false", 0, true)
 
@@ -198,93 +202,90 @@ func getMQTTClient(ip, port, user, password string) mqtt.Client {
 		panic(token.Error())
 	}
 
-	return client
+	return &MQQTClient{
+		client: client,
+	}
 }
 
 func getTopicPrefix() string {
 	return "mac2mqtt/" + hostname
 }
 
-func listen(client mqtt.Client, topic string) {
-
-	token := client.Subscribe(topic, 0, func(client mqtt.Client, msg mqtt.Message) {
-
-		if msg.Topic() == getTopicPrefix()+"/command/volume" {
-
+func listen(client *MQQTClient, topic string) {
+	token := client.Subscribe(topic, 0, func(client *MQQTClient, msg mqtt.Message) {
+		fmt.Printf("DEBUG: received message: %v\n", msg)
+		switch strings.TrimPrefix(msg.Topic(), getTopicPrefix()) {
+		case "/command/music/volume":
 			i, err := strconv.Atoi(string(msg.Payload()))
 			if err == nil && i >= 0 && i <= 100 {
-
-				setVolume(i)
-
-				updateVolume(client)
-				updateMute(client)
-
+				setMusicVolume(uint8(i))
+				updateMusic(client)
 			} else {
-				log.Println("Incorrect value")
+				log.Println("Incorrect value: " + string(msg.Payload()))
 			}
-
-		}
-
-		if msg.Topic() == getTopicPrefix()+"/command/mute" {
-
+		case "/command/music/playpause":
 			b, err := strconv.ParseBool(string(msg.Payload()))
 			if err == nil {
-				setMute(b)
-
-				updateVolume(client)
-				updateMute(client)
-
+				setMusicPlayPause(b)
+				updateMusic(client)
 			} else {
-				log.Println("Incorrect value")
+				log.Println("Incorrect value: " + string(msg.Payload()))
 			}
-
-		}
-
-		if msg.Topic() == getTopicPrefix()+"/command/sleep" {
-
-			if string(msg.Payload()) == "sleep" {
-				commandSleep()
-			}
-
-		}
-
-		if msg.Topic() == getTopicPrefix()+"/command/displaysleep" {
-
-			if string(msg.Payload()) == "displaysleep" {
-				commandDisplaySleep()
-			}
-
-		}
-
-		if msg.Topic() == getTopicPrefix()+"/command/shutdown" {
-
-			if string(msg.Payload()) == "shutdown" {
-				commandShutdown()
-			}
-
 		}
 
 	})
 
 	token.Wait()
 	if token.Error() != nil {
-		log.Printf("Token error: %s\n", token.Error())
+		log.Printf("failed subscribing to topic: %s\n", token.Error())
 	}
 }
 
-func updateVolume(client mqtt.Client) {
-	token := client.Publish(getTopicPrefix()+"/status/volume", 0, false, strconv.Itoa(getCurrentVolume()))
-	token.Wait()
+type MusicState struct {
+	PlayerState string `yaml:"state"`
+	TrackId     string `yaml:"trackID"`
+	TrackName   string `yaml:"trackName"`
+	TrackArtist string `yaml:"trackArtist"`
+	Volume      string `yaml:"volume"`
 }
 
-func updateMute(client mqtt.Client) {
-	token := client.Publish(getTopicPrefix()+"/status/mute", 0, false, strconv.FormatBool(getMuteStatus()))
-	token.Wait()
+func updateMusic(client *MQQTClient) {
+	value, err := mack.Tell("Music",
+		"set playerState to get player state",
+		"set currentTrackID to get id of current track",
+		"set currentTrackName to get name of current track",
+		"set currentTrackArtist to get artist of current track",
+		"set currentVolume to get sound volume",
+		"set returnDict to {state:playerState, trackID:currentTrackID, trackArtist:currentTrackArtist, trackName:currentTrackName, volume:currentVolume}",
+		"return returnDict",
+	)
+	if err != nil {
+		fmt.Printf("Error: %v", err)
+		return
+	}
+	//fmt.Printf("DEBUG: %v\n", value)
+
+	// convert output to Yaml to parse using standard library methods
+	tmpYaml := strings.ReplaceAll(value, ", ", "\n")
+	tmpYaml = strings.ReplaceAll(tmpYaml, ":", ": ")
+	var musicState MusicState
+	if err := yaml.Unmarshal([]byte(tmpYaml), &musicState); err != nil {
+		fmt.Printf("Error: %v", err)
+		return
+	}
+
+	// publish each record to the broker
+	client.PublishAndWait("/status/music/volume", 0, false, musicState.Volume)
+	client.PublishAndWait("/status/music/state", 0, false, musicState.PlayerState)
+	client.PublishAndWait("/status/music/trackID", 0, false, musicState.TrackId)
+	client.PublishAndWait("/status/music/trackName", 0, false, musicState.TrackName)
+	client.PublishAndWait("/status/music/trackArtist", 0, false, musicState.TrackArtist)
 }
 
 func getBatteryChargePercent() string {
 
 	output := getCommandOutput("/usr/bin/pmset", "-g", "batt")
+	//fmt.Printf("DEBUG: battery output: %v\n", output)
 
 	// $ /usr/bin/pmset -g batt
 	// Now drawing from 'Battery Power'
@@ -296,9 +297,8 @@ func getBatteryChargePercent() string {
 	return percent
 }
 
-func updateBattery(client mqtt.Client) {
-	token := client.Publish(getTopicPrefix()+"/status/battery", 0, false, getBatteryChargePercent())
-	token.Wait()
+func updateBattery(client *MQQTClient) {
+	client.PublishAndWait("/status/battery", 0, false, getBatteryChargePercent())
 }
 
 func main() {
@@ -313,16 +313,15 @@ func main() {
 	hostname = getHostname()
 	mqttClient := getMQTTClient(c.getBrokerUri(), c.User, c.Password, getTopicPrefix())
 
-	volumeTicker := time.NewTicker(2 * time.Second)
+	musicTicker := time.NewTicker(5 * time.Second)
 	batteryTicker := time.NewTicker(60 * time.Second)
 
 	wg.Add(1)
 	go func() {
 		for {
 			select {
-			case _ = <-volumeTicker.C:
-				updateVolume(mqttClient)
-				updateMute(mqttClient)
+			case _ = <-musicTicker.C:
+				updateMusic(mqttClient)
 
 			case _ = <-batteryTicker.C:
 				updateBattery(mqttClient)

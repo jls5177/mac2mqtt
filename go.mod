@@ -8,7 +8,8 @@ require (
 )
 
 require (
-	github.com/gorilla/websocket v1.4.2 // indirect
-	golang.org/x/net v0.0.0-20200425230154-ff2c4b7c35a0 // indirect
+	github.com/andybrewer/mack v0.0.0-20220307193339-22e922cc18af // indirect
+	github.com/gorilla/websocket v1.5.0 // indirect
+	golang.org/x/net v0.0.0-20220812174116-3211cb980234 // indirect
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c // indirect
 )
