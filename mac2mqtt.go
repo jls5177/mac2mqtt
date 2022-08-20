@@ -23,6 +23,7 @@ type config struct {
 	Port     string `yaml:"mqtt_port"`
 	User     string `yaml:"mqtt_user"`
 	Password string `yaml:"mqtt_password"`
+	Protocol string `yaml:"mqtt_protocol"`
 }
 
 func (c *config) getConfig() *config {
@@ -53,7 +54,16 @@ func (c *config) getConfig() *config {
 		log.Fatal("Must specify mqtt_password in mac2mqtt.yaml")
 	}
 
+	if c.Protocol == "" {
+		log.Println("Warning: mqtt_protocol not specified in mac2mqtt.yaml: assuming tcp")
+		c.Protocol = "tcp"
+	}
+
 	return c
+}
+
+func (c *config) getBrokerUri() string {
+	return fmt.Sprintf("%s://%s:%s", c.Protocol, c.Ip, c.Port)
 }
 
 func getHostname() string {
@@ -301,7 +311,7 @@ func main() {
 	var wg sync.WaitGroup
 
 	hostname = getHostname()
-	mqttClient := getMQTTClient(c.Ip, c.Port, c.User, c.Password)
+	mqttClient := getMQTTClient(c.getBrokerUri(), c.User, c.Password, getTopicPrefix())
 
 	volumeTicker := time.NewTicker(2 * time.Second)
 	batteryTicker := time.NewTicker(60 * time.Second)
