@@ -1,3 +1,7 @@
+> Note: this is a personal fork of `mac2mqtt` to support Apple Music control and reporting
+> of Meeting status to Home Assistant using MuteSync. I plan to (eventually) contribute these changes back
+> to upstream once I add support for plugins to easily extend the functionality. 
+
 # mac2mqtt
 
 `mac2mqtt` is a program that allow viewing and controlling some aspects of computers running macOS via MQTT.
