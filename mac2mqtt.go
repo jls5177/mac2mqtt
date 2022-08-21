@@ -265,24 +265,28 @@ func listen(client *MQQTClient, topic string) {
 
 type MusicState struct {
 	PlayerState string `yaml:"state"`
-	TrackId     string `yaml:"trackID"`
-	TrackName   string `yaml:"trackName"`
-	TrackArtist string `yaml:"trackArtist"`
+	TrackId     string `yaml:"trackID,omitempty"`
+	TrackName   string `yaml:"trackName,omitempty"`
+	TrackArtist string `yaml:"trackArtist,omitempty"`
 	Volume      string `yaml:"volume"`
 }
 
 func updateMusic(client *MQQTClient) {
 	value, err := mack.Tell("Music",
 		"set playerState to get player state",
+		"set currentVolume to get sound volume",
+		"if playerState is stopped then",
+		"return {state:playerState, volume:currentVolume}",
+		"end if",
 		"set currentTrackID to get id of current track",
 		"set currentTrackName to get name of current track",
 		"set currentTrackArtist to get artist of current track",
-		"set currentVolume to get sound volume",
-		"set returnDict to {state:playerState, trackID:currentTrackID, trackArtist:currentTrackArtist, trackName:currentTrackName, volume:currentVolume}",
+		"set returnDict to {state:playerState, volume:currentVolume, trackID:currentTrackID, trackArtist:currentTrackArtist, trackName:currentTrackName}",
 		"return returnDict",
 	)
 	if err != nil {
-		fmt.Printf("Error: %v", err)
+		fmt.Printf("Error: %v\n", err)
+		client.PublishAndWait("/status/music/state", 0, false, "unknown")
 		return
 	}
 	//fmt.Printf("DEBUG: %v\n", value)
@@ -292,7 +296,7 @@ func updateMusic(client *MQQTClient) {
 	tmpYaml = strings.ReplaceAll(tmpYaml, ":", ": ")
 	var musicState MusicState
 	if err := yaml.Unmarshal([]byte(tmpYaml), &musicState); err != nil {
-		fmt.Printf("Error: %v", err)
+		fmt.Printf("Error: %v\n", err)
 		return
 	}
 
