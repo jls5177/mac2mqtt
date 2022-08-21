@@ -6,7 +6,6 @@ import (
 	"github.com/andybrewer/mack"
 	"gopkg.in/yaml.v2"
 	"io"
-	"log"
 	"math/rand"
 	"net/http"
 	"os"
@@ -18,7 +17,27 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	log "github.com/sirupsen/logrus"
 )
+
+func init() {
+	log.SetFormatter(&log.TextFormatter{
+		FullTimestamp: true,
+	})
+	//log.SetReportCaller(true)
+
+	// Only log the warning severity or above.
+	log.SetLevel(log.InfoLevel)
+
+	// Output to file if available
+	//file, err := os.OpenFile("mac2mqtt.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	//if err == nil {
+	//	log.SetOutput(file)
+	//} else {
+	//	log.SetOutput(os.Stdout)
+	//	log.Info("Failed to log to file, using default stderr")
+	//}
+}
 
 var hostname string
 
@@ -67,7 +86,7 @@ func (c *config) getConfig() *config {
 	}
 
 	if c.Protocol == "" {
-		log.Println("Warning: mqtt_protocol not specified in mac2mqtt.yaml: assuming tcp")
+		log.Warning("mqtt_protocol not specified in mac2mqtt.yaml: assuming tcp")
 		c.Protocol = "tcp"
 	}
 
@@ -135,10 +154,10 @@ func runCommand(name string, arg ...string) {
 }
 
 func setMusicVolume(level uint8) {
-	fmt.Printf("DEBUG: telling Music to set volume level to %v\n", level)
+	log.WithField("lvl", level).Info("telling Music to set volume level")
 	_, err := mack.Tell("Music", fmt.Sprintf("set sound volume to %v", level))
 	if err != nil {
-		fmt.Println(fmt.Errorf("failed to set music volume to %v: %v", level, err))
+		log.WithField("lvl", level).Errorf("failed to set music volume: %e", err)
 	}
 }
 
@@ -149,10 +168,10 @@ func setMusicPlayPause(play bool) {
 	} else {
 		op = "pause"
 	}
-	fmt.Printf("DEBUG: telling Music to %v\n", op)
+	log.Info("telling Music to " + op)
 	_, err := mack.Tell("Music", op)
 	if err != nil {
-		fmt.Println(fmt.Errorf("failed telling Music to %v: %v", op, err))
+		log.Errorf("failed telling Music to %s: %e", op, err)
 	}
 }
 
@@ -172,7 +191,8 @@ var connectHandler mqtt.OnConnectHandler = func(client mqtt.Client) {
 }
 
 var connectLostHandler mqtt.ConnectionLostHandler = func(client mqtt.Client, err error) {
-	log.Printf("Disconnected from MQTT: %v\n", err)
+	// TODO: add a (done) channel to break out of the main loop
+	log.Error("Disconnected from MQTT: %e", err)
 }
 
 func NewMQQTClient(client mqtt.Client) *MQQTClient {
@@ -192,7 +212,7 @@ func (c *MQQTClient) PublishAndWait(topic string, qos byte, retained bool, msg i
 	go func() {
 		ok := t.WaitTimeout(1 * time.Second)
 		if t.Error() != nil {
-			fmt.Println(fmt.Errorf("failed publishing message to topic, %s: %v", topic, t.Error()))
+			log.Errorf("failed publishing message to topic, %s: %e", topic, t.Error())
 		} else if !ok {
 			fmt.Printf(fmt.Sprintf("timed out publishing message to topic, %s", topic))
 		}
@@ -208,7 +228,7 @@ func (c *MQQTClient) Subscribe(topic string, qos byte, callback MQQTMessageHandl
 func getMQTTClient(broker_uri, user, password, topicPrefix string) *MQQTClient {
 	opts := mqtt.NewClientOptions()
 	opts.AddBroker(broker_uri)
-	opts.SetClientID(fmt.Sprintf("mac2mqtt-%v", strconv.Itoa(int(uint8(rand.Uint32())))))
+	opts.SetClientID(fmt.Sprintf("mac2mqtt-%s", strconv.Itoa(int(uint8(rand.Uint32())))))
 	opts.SetUsername(user)
 	opts.SetPassword(password)
 	opts.OnConnect = connectHandler
@@ -235,7 +255,7 @@ func getTopicPrefix() string {
 
 func listen(client *MQQTClient, topic string) {
 	token := client.Subscribe(topic, 0, func(client *MQQTClient, msg mqtt.Message) {
-		fmt.Printf("DEBUG: received message: %v\n", msg)
+		log.WithField("msg", msg).Debug("received subscription callback")
 		switch strings.TrimPrefix(msg.Topic(), getTopicPrefix()) {
 		case "/command/music/volume":
 			i, err := strconv.Atoi(string(msg.Payload()))
@@ -285,18 +305,18 @@ func updateMusic(client *MQQTClient) {
 		"return returnDict",
 	)
 	if err != nil {
-		fmt.Printf("Error: %v\n", err)
+		log.Error(err)
 		client.PublishAndWait("/status/music/state", 0, false, "unknown")
 		return
 	}
-	//fmt.Printf("DEBUG: %v\n", value)
+	log.WithField("output", value).Debug("updateMusic output")
 
 	// convert output to Yaml to parse using standard library methods
 	tmpYaml := strings.ReplaceAll(value, ", ", "\n")
 	tmpYaml = strings.ReplaceAll(tmpYaml, ":", ": ")
 	var musicState MusicState
 	if err := yaml.Unmarshal([]byte(tmpYaml), &musicState); err != nil {
-		fmt.Printf("Error: %v\n", err)
+		log.Error(err)
 		return
 	}
 
@@ -311,7 +331,7 @@ func updateMusic(client *MQQTClient) {
 func getBatteryChargePercent() string {
 
 	output := getCommandOutput("/usr/bin/pmset", "-g", "batt")
-	//fmt.Printf("DEBUG: battery output: %v\n", output)
+	log.Debug("battery output", output)
 
 	// $ /usr/bin/pmset -g batt
 	// Now drawing from 'Battery Power'
@@ -342,7 +362,7 @@ func updateMuteSync(client *MQQTClient, config *MuteSyncConfig) {
 	muteSyncUri := fmt.Sprintf("http://%s:%s/state", config.Ip, config.Port)
 	req, err := http.NewRequest(http.MethodGet, muteSyncUri, nil)
 	if err != nil {
-		fmt.Printf("Error: %v\n", err)
+		log.Error(err)
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+config.Token)
@@ -350,31 +370,28 @@ func updateMuteSync(client *MQQTClient, config *MuteSyncConfig) {
 
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		fmt.Printf("Error: making http request: %s\n", err)
+		log.Errorf("http request failed: %e", err)
 		return
 	}
 
 	resBody, err := io.ReadAll(res.Body)
 	if err != nil {
-		fmt.Printf("client: could not read response body: %s\n", err)
+		log.Errorf("client: could not read response body: %e", err)
 		return
 	}
 
 	var muteSync MuteSyncResponse
 	if err := json.Unmarshal(resBody, &muteSync); err != nil {
-		fmt.Printf("Error: %v\n", err)
+		log.Errorf("failed to unmarshal muteSync response: %e", err)
 		return
 	}
 
-	//fmt.Printf("DEBUG-MuteSync: %+v\n", muteSync)
+	log.WithField("mutesync", muteSync).Debug("updating mutesync")
 	client.PublishAndWait("/status/mutesync/inMeeting", 0, false, strconv.FormatBool(muteSync.Data.InMeeting))
 	client.PublishAndWait("/status/mutesync/muted", 0, false, strconv.FormatBool(muteSync.Data.Muted))
 }
 
 func main() {
-
-	log.Println("Started")
-
 	var c config
 	c.getConfig()
 
@@ -386,6 +403,7 @@ func main() {
 	musicTicker := time.NewTicker(2 * time.Second)
 	batteryTicker := time.NewTicker(60 * time.Second)
 
+	log.Info("Started")
 	wg.Add(1)
 	go func() {
 		for {
