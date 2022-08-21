@@ -1,12 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/andybrewer/mack"
 	"gopkg.in/yaml.v2"
-	"io/ioutil"
+	"io"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
@@ -20,17 +22,25 @@ import (
 
 var hostname string
 
+type MuteSyncConfig struct {
+	Ip    string `yaml:"mutesync_ip"`
+	Port  string `yaml:"mutesync_port"`
+	Token string `yaml:"mutesync_token"`
+	Valid bool   `yaml:"-"`
+}
+
 type config struct {
-	Ip       string `yaml:"mqtt_ip"`
-	Port     string `yaml:"mqtt_port"`
-	User     string `yaml:"mqtt_user"`
-	Password string `yaml:"mqtt_password"`
-	Protocol string `yaml:"mqtt_protocol"`
+	Ip             string `yaml:"mqtt_ip"`
+	Port           string `yaml:"mqtt_port"`
+	User           string `yaml:"mqtt_user"`
+	Password       string `yaml:"mqtt_password"`
+	Protocol       string `yaml:"mqtt_protocol"`
+	MuteSyncConfig `yaml:",inline"`
 }
 
 func (c *config) getConfig() *config {
 
-	configContent, err := ioutil.ReadFile("mac2mqtt.yaml")
+	configContent, err := os.ReadFile("mac2mqtt.yaml")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -59,6 +69,18 @@ func (c *config) getConfig() *config {
 	if c.Protocol == "" {
 		log.Println("Warning: mqtt_protocol not specified in mac2mqtt.yaml: assuming tcp")
 		c.Protocol = "tcp"
+	}
+
+	if c.MuteSyncConfig.Token != "" {
+		if c.MuteSyncConfig.Ip == "" {
+			c.MuteSyncConfig.Ip = "127.0.0.1"
+		}
+		if c.MuteSyncConfig.Port == "" {
+			c.MuteSyncConfig.Port = "8249"
+		}
+		c.MuteSyncConfig.Valid = true
+	} else {
+		c.MuteSyncConfig.Valid = false
 	}
 
 	return c
@@ -150,7 +172,7 @@ var connectHandler mqtt.OnConnectHandler = func(client mqtt.Client) {
 }
 
 var connectLostHandler mqtt.ConnectionLostHandler = func(client mqtt.Client, err error) {
-	log.Printf("Disconnected from MQTT: %v", err)
+	log.Printf("Disconnected from MQTT: %v\n", err)
 }
 
 func NewMQQTClient(client mqtt.Client) *MQQTClient {
@@ -301,6 +323,50 @@ func updateBattery(client *MQQTClient) {
 	client.PublishAndWait("/status/battery", 0, false, getBatteryChargePercent())
 }
 
+type MuteSync struct {
+	Hostname  string `json:"hostname"`
+	InMeeting bool   `json:"in_meeting"`
+	Muted     bool   `json:"muted"`
+	UserId    string `json:"user-id"`
+}
+
+type MuteSyncResponse struct {
+	Data MuteSync `json:"Data"`
+}
+
+func updateMuteSync(client *MQQTClient, config *MuteSyncConfig) {
+	muteSyncUri := fmt.Sprintf("http://%s:%s/state", config.Ip, config.Port)
+	req, err := http.NewRequest(http.MethodGet, muteSyncUri, nil)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+config.Token)
+	req.Header.Add("Accept", "application/json")
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Printf("Error: making http request: %s\n", err)
+		return
+	}
+
+	resBody, err := io.ReadAll(res.Body)
+	if err != nil {
+		fmt.Printf("client: could not read response body: %s\n", err)
+		return
+	}
+
+	var muteSync MuteSyncResponse
+	if err := json.Unmarshal(resBody, &muteSync); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	//fmt.Printf("DEBUG-MuteSync: %+v\n", muteSync)
+	client.PublishAndWait("/status/mutesync/inMeeting", 0, false, strconv.FormatBool(muteSync.Data.InMeeting))
+	client.PublishAndWait("/status/mutesync/muted", 0, false, strconv.FormatBool(muteSync.Data.Muted))
+}
+
 func main() {
 
 	log.Println("Started")
@@ -313,7 +379,7 @@ func main() {
 	hostname = getHostname()
 	mqttClient := getMQTTClient(c.getBrokerUri(), c.User, c.Password, getTopicPrefix())
 
-	musicTicker := time.NewTicker(5 * time.Second)
+	musicTicker := time.NewTicker(2 * time.Second)
 	batteryTicker := time.NewTicker(60 * time.Second)
 
 	wg.Add(1)
@@ -322,6 +388,9 @@ func main() {
 			select {
 			case _ = <-musicTicker.C:
 				updateMusic(mqttClient)
+				if c.MuteSyncConfig.Valid {
+					updateMuteSync(mqttClient, &c.MuteSyncConfig)
+				}
 
 			case _ = <-batteryTicker.C:
 				updateBattery(mqttClient)
